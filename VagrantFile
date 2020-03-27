@@ -7,17 +7,17 @@ servers = [
         :type => "master",
         :box => "ubuntu/xenial64",
         :box_version => "20180831.0.0",
-        :eth1 => "192.168.206.10",
+        :eth1 => "192.169.99.10",
         :mem => "2048",
-        :cpu => "1"
+        :cpu => "2"
     },
     {
         :name => "k8s-node-1",
         :type => "node",
         :box => "ubuntu/xenial64",
         :box_version => "20180831.0.0",
-        :eth1 => "192.168.206.11",
-        :mem => "4096",
+        :eth1 => "192.169.99.11",
+        :mem => "2048",
         :cpu => "2"
     },
     {
@@ -25,21 +25,25 @@ servers = [
         :type => "node",
         :box => "ubuntu/xenial64",
         :box_version => "20180831.0.0",
-        :eth1 => "192.168.206.12",
-        :mem => "4096",
+        :eth1 => "192.169.99.12",
+        :mem => "2048",
         :cpu => "2"
     }
 ]
 
 # This script to install k8s using kubeadm will get executed after a box is provisioned
 $configureBox = <<-SCRIPT
-    # install docker v17.03
+    # install docker v19.03.4
     # reason for not using docker provision is that it always installs latest version of the docker, but kubeadm requires 17.03 or older
     apt-get update
-    apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+    apt-get install -y apt-transport-https ca-certificates curl software-properties-common gnupg2
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
     add-apt-repository "deb https://download.docker.com/linux/$(. /etc/os-release; echo "$ID") $(lsb_release -cs) stable"
-    apt-get update && apt-get install -y docker-ce=$(apt-cache madison docker-ce | grep 17.03 | head -1 | awk '{print $3}')
+    ## Install Docker CE.
+    apt-get update && apt-get install -y \
+      containerd.io=1.2.10-3 \
+      docker-ce=5:19.03.4~3-0~ubuntu-$(lsb_release -cs) \
+      docker-ce-cli=5:19.03.4~3-0~ubuntu-$(lsb_release -cs)
 
     # Setup daemon.
     cat <<EOF >/etc/docker/daemon.json
@@ -92,7 +96,7 @@ $configureMaster = <<-SCRIPT
     IP_ADDR=`ifconfig enp0s8 | grep Mask | awk '{print $2}'| cut -f2 -d:`
     # install k8s master
     HOST_NAME=$(hostname -s)
-    kubeadm init --apiserver-advertise-address=$IP_ADDR --apiserver-cert-extra-sans=$IP_ADDR  --node-name $HOST_NAME --pod-network-cidr=192.169.0.0/16
+    kubeadm init --apiserver-advertise-address=$IP_ADDR --apiserver-cert-extra-sans=$IP_ADDR  --node-name $HOST_NAME --pod-network-cidr=192.168.0.0/16
     #copying credentials to regular user - vagrant
     sudo --user=vagrant mkdir -p /home/vagrant/.kube
     cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
@@ -108,10 +112,33 @@ $configureMaster = <<-SCRIPT
     sudo service sshd restart
 SCRIPT
 
+$configureMetalLB = <<-SCRIPT
+    kubectl apply -f https://raw.githubusercontent.com/google/metallb/v0.9.3/manifests/namespace.yaml --kubeconfig /home/vagrant/.kube/config
+    kubectl apply -f https://raw.githubusercontent.com/google/metallb/v0.9.3/manifests/metallb.yaml --kubeconfig /home/vagrant/.kube/config
+    # On first install only
+    kubectl create secret generic -n metallb-system memberlist --from-literal=secretkey="$(openssl rand -base64 128)" --kubeconfig /home/vagrant/.kube/config
+
+    # Set up the IP ranges for MetalLB to manage
+    cat <<EOF | kubectl create --kubeconfig /home/vagrant/.kube/config -f -
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      namespace: metallb-system
+      name: config
+    data:
+      config: |
+        address-pools:
+        - name: default
+          protocol: layer2
+          addresses:
+          - 192.169.99.100-192.169.99.164
+EOF
+SCRIPT
+
 $configureNode = <<-SCRIPT
     echo "This is worker"
     apt-get install -y sshpass
-    sshpass -p "vagrant" scp -o StrictHostKeyChecking=no vagrant@192.168.206.10:/etc/kubeadm_join_cmd.sh .
+    sshpass -p "vagrant" scp -o StrictHostKeyChecking=no vagrant@192.169.99.10:/etc/kubeadm_join_cmd.sh .
     echo "Joining Cluster"
     sh ./kubeadm_join_cmd.sh
 SCRIPT
@@ -129,7 +156,7 @@ Vagrant.configure("2") do |config|
             config.vm.provider "virtualbox" do |v|
 
                 v.name = opts[:name]
-            	 v.customize ["modifyvm", :id, "--groups", "/Istio-Flannel Test Development"]
+            	v.customize ["modifyvm", :id, "--groups", "/K8s Dev-Local Development"]
                 v.customize ["modifyvm", :id, "--memory", opts[:mem]]
                 v.customize ["modifyvm", :id, "--cpus", opts[:cpu]]
 
@@ -142,6 +169,7 @@ Vagrant.configure("2") do |config|
 
             if opts[:type] == "master"
                 config.vm.provision "shell", inline: $configureMaster
+                config.vm.provision "shell", inline: $configureMetalLB
             else
                 config.vm.provision "shell", inline: $configureNode
             end
